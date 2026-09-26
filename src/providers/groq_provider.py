@@ -10,6 +10,7 @@ from src.providers.base import safe_error_message
 class Provider:
     def __init__(self, config):
         self.config = config
+        self.actual_model = ""
 
     def generate(self, prompt: str, messages: list[dict[str, str]], *, json_mode: bool = False, use_tools: bool = True) -> str:
         try:
@@ -29,6 +30,7 @@ class Provider:
             elif json_mode:
                 body["response_format"] = {"type": "json_object"}
             response = client.chat.completions.create(**body)
+            self.actual_model = str(getattr(response, "model", "") or "")
             message = response.choices[0].message
             tool_calls = getattr(message, "tool_calls", None)
             if tool_calls:

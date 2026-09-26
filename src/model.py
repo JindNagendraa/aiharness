@@ -38,25 +38,32 @@ class TextModel:
         self.primary = (provider or os.environ.get("PRIMARY_PROVIDER", "").strip() or ("openrouter" if os.environ.get("AI_API_KEY") else "openrouter")).lower()
         self.fallback = fallback
         self.active_provider = ""
+        self.active_model = ""
+        self.last_model = ""
         self.available = configured_providers()
 
     def _order(self) -> list[str]:
-        if os.environ.get("AI_API_KEY", "").strip():
-            return ["openrouter"] + [p for p in self._configured_order() if p != "openrouter"]
-        configured = self.available
-        fallbacks = self.fallback if self.fallback is not None else [p.strip().lower() for p in os.environ.get("FALLBACK_PROVIDERS", "").split(",") if p.strip()]
-        requested = os.environ.get("PRIMARY_PROVIDER", "").strip().lower() or self.primary
+        # The evaluator's generic key intentionally maps to OpenRouter. Keep
+        # that compatibility, while treating an explicitly empty fallback
+        # variable as "do not fall back" instead of silently trying every
+        # configured provider.
+        evaluator_key = bool(os.environ.get("AI_API_KEY", "").strip())
+        requested = "openrouter" if evaluator_key else (
+            os.environ.get("PRIMARY_PROVIDER", "").strip().lower() or self.primary
+        )
         if requested not in {"openrouter", "groq"}:
             raise ModelError(f"Invalid PRIMARY_PROVIDER: {requested}")
+        if self.fallback is not None:
+            fallbacks = [str(p).strip().lower() for p in self.fallback if str(p).strip()]
+        elif "FALLBACK_PROVIDERS" in os.environ:
+            fallbacks = [p.strip().lower() for p in os.environ["FALLBACK_PROVIDERS"].split(",") if p.strip()]
+        else:
+            # Preserve the historical default: other configured providers are
+            # fallbacks only when the setting is omitted entirely.
+            fallbacks = [p for p in self.available if p != requested]
         invalid = [p for p in fallbacks if p not in {"openrouter", "groq"}]
         if invalid: raise ModelError(f"Invalid fallback provider: {invalid[0]}")
-        return [p for p in dict.fromkeys([requested] + fallbacks + configured) if p in configured]
-
-    def _configured_order(self) -> list[str]:
-        configured = self.available
-        fallbacks = self.fallback if self.fallback is not None else [p.strip().lower() for p in os.environ.get("FALLBACK_PROVIDERS", "").split(",") if p.strip()]
-        order = [self.primary] + fallbacks + [p for p in configured if p != self.primary and p not in fallbacks]
-        return [p for p in dict.fromkeys(order) if p in configured]
+        return [p for p in dict.fromkeys([requested] + fallbacks) if p in self.available]
 
     def generate(self, messages: list[dict[str, str]], *, json_mode: bool = False) -> str:
         from src.providers.base import messages_to_prompt
@@ -67,10 +74,14 @@ class TextModel:
                 config = ProviderConfig.from_env(name)
                 if not config.api_key: continue
                 if not config.model:
-                    raise ModelError(f"{name} model is not configured; set {name.upper()}_MODEL")
+                    evaluator_default = name == "openrouter" and bool(os.environ.get("AI_API_KEY", "").strip())
+                    if not evaluator_default:
+                        raise ModelError(f"{name} model is not configured; set {name.upper()}_MODEL")
+                self.last_model = config.model
                 provider = create_provider(config)
                 value = provider.generate(messages_to_prompt(messages, json_mode=json_mode), messages, json_mode=json_mode)
                 self.active_provider = name
+                self.active_model = getattr(provider, "actual_model", "") or config.model
                 return value
             except Exception as exc:
                 if isinstance(exc, (ProviderError, ModelError)):
@@ -88,7 +99,8 @@ class TextModel:
         else:
             requested = os.environ.get("PRIMARY_PROVIDER", self.primary).strip().lower()
             if requested not in {"openrouter", "groq"}: requested = "openrouter"
-            detail = f"no supported provider is configured; set {requested.upper()}_API_KEY and {requested.upper()}_MODEL, or configure the other provider for fallback (evaluator AI_API_KEY and AI_MODEL map to OpenRouter)"
+            model_hint = " (AI_MODEL is optional when the evaluator endpoint selects its own model)" if requested == "openrouter" and os.environ.get("AI_API_KEY", "").strip() else " and the corresponding model setting"
+            detail = f"no supported provider is configured; set {requested.upper()}_API_KEY{model_hint}, or configure the other provider for fallback (evaluator AI_API_KEY maps to OpenRouter)"
         raise ModelError(f"No configured provider succeeded ({detail})")
 
 class ModelConfig(ProviderConfig):

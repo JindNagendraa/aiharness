@@ -1,73 +1,94 @@
-# AI Coding-Agent Harness
+# ForgeAI AI Coding Harness
 
-A text-only Python coding agent that inspects a target repository, plans work, uses a small JSON action protocol to read/search/edit files and run commands, then verifies the result. It does not execute model-generated Python.
+ForgeAI is a text-only coding harness for focused engineering tasks in an existing repository. It uses a structured action protocol, scoped repository tools, verification, and bounded recovery. The official user and execution interface is the terminal UI (TUI), launched with `make run`.
 
 ## Architecture
 
-`src/main.py` parses the CLI; `src/agent.py` coordinates a bounded action loop; `src/model.py` routes through a provider-agnostic interface in `src/providers/`; `context.py`, `planner.py`, `recovery.py`, and `verifier.py` manage working memory, plan state, bounded recovery, and verification. `tools/` contains repository-scoped file/search operations, timed command execution, and read-only Git inspection.
+```text
+make run → TUI → Agent → TextModel → OpenRouter / Groq
+                    ↓
+             Repository tools → Verification → bounded Recovery → TUI result
+```
 
-## Requirements and setup
+The TUI wraps the real `src.agent.Agent`; it does not duplicate planning, provider selection, tool execution, verification, or recovery.
 
-Python 3.10+ and `make` are required. From this directory run:
+## TUI
+
+The TUI shows the selected repository, active provider and model (when returned by the provider), harness state, Agent activity, verification output, recovery attempts, and the result returned by the Agent. The Agent runs in a background thread so the interface can continue to update. Statuses include `READY`, `PLANNING`, `WORKING`, `VERIFYING`, `RECOVERING`, `SUCCESS`, and `FAILED`.
+
+Controls:
+
+- Enter: run the entered task
+- `c`: clear after a submitted task (Ctrl+U clears while editing)
+- `r`: rerun the previous task
+- `q`: quit when no run is active and the task is not being edited (Ctrl+U clears a draft first)
+- Backspace: edit the current task
+
+## Agent and tools
+
+The Agent plans a bounded sequence of actions and accepts only structured JSON decisions. Tools in `tools/` provide repository-scoped file access, search, timed terminal commands, and read-only Git status. File tools prevent paths and symlinks from escaping the selected repository. Terminal commands have a timeout and block common destructive operations.
+
+## Verification and recovery
+
+The harness runs the configured verification command after the Agent finishes. Repositories with recognizable tests receive a baseline verification first. Verification failures are reported to the Agent for a bounded repair attempt, subject to existing retry and action limits. The TUI shows verification output and recovery activity emitted by the real Agent.
+
+## Provider configuration
+
+Provider credentials are read from environment variables and are never stored in source files. Configure either provider or both to enable fallback:
 
 ```sh
-python3 -m venv .venv
-source .venv/bin/activate
+export OPENROUTER_API_KEY="YOUR_OPENROUTER_KEY"
+export OPENROUTER_MODEL="MODEL_AVAILABLE_TO_YOUR_ACCOUNT"
+export GROQ_API_KEY="YOUR_GROQ_KEY" # optional fallback
+export GROQ_MODEL="MODEL_AVAILABLE_TO_YOUR_ACCOUNT" # optional fallback
+export PRIMARY_PROVIDER=openrouter
+export FALLBACK_PROVIDERS=groq
+```
+
+The evaluation environment may supply only `AI_API_KEY`; this routes through OpenRouter. `AI_MODEL` and `AI_BASE_URL` are also supported when the evaluator specifies them. If the evaluator endpoint chooses a model when `model` is omitted, the harness leaves that choice to the endpoint rather than guessing a model name. An actual task run still requires working evaluator credentials and an endpoint that supports the harness's native tool definitions. The harness does not make provider calls during setup or tests.
+
+## Setup
+
+Python 3.10+ and `make` are required. From the repository root:
+
+```sh
+export AI_API_KEY="PROVIDED_API_KEY"
 make setup
 ```
 
-Set credentials and organizer model configuration in the environment. Never put a real key in source or commit it:
+`make setup` creates/uses `.venv` and installs the Python dependencies. The evaluator provides the value for `AI_API_KEY`; export that value in your shell. No source changes or extra setup files are required. Keep credentials in environment variables, not tracked files.
+
+## Running
+
+The primary workflow launches the TUI:
 
 ```sh
-export OPENROUTER_API_KEY="YOUR_KEY"
-export OPENROUTER_MODEL="YOUR_MODEL"
-export GROQ_API_KEY="YOUR_KEY" # optional
-export GROQ_MODEL="YOUR_MODEL" # choose a model available to your account
-export PRIMARY_PROVIDER=openrouter
-export FALLBACK_PROVIDERS=groq
-# Or reverse the order:
-export PRIMARY_PROVIDER=groq
-export FALLBACK_PROVIDERS=openrouter
-# Hackathon evaluator settings route through the OpenRouter adapter:
-export AI_API_KEY="<PROVIDED_API_KEY>"
-export AI_MODEL="<ORGANIZER_PRESCRIBED_MODEL>"
-export AI_BASE_URL="<EVALUATOR_API_BASE_URL>" # optional
+make run
 ```
 
-`.env.example` contains empty placeholders. The harness reads environment variables directly; `.env` is ignored. Never commit API keys. Evaluator `AI_API_KEY` and `AI_MODEL` take precedence and route through the OpenRouter adapter; set `AI_BASE_URL` if the evaluator supplies a compatible endpoint other than OpenRouter.
-
-## Run
-
-Run from the harness root, targeting the current directory:
+The default repository is `.`. To target a different repository:
 
 ```sh
-make run TASK='Fix the bug in this repository'
+make run REPO=leetcode_lab
 ```
 
-Or target another repository:
+For automation or a pre-supplied task, the existing noninteractive CLI remains available through Make:
 
 ```sh
-.venv/bin/python -m src.main --repo /path/to/repository 'Fix the bug'
+make run TASK="Fix the bug in this repository" REPO=.
 ```
 
-Without a positional task the CLI prompts interactively. Verification defaults to `python -m pytest -q`; override with `--verify 'command'`.
+The CLI also accepts `--verify 'command'` when invoked directly with `python -m src.main`. Verification defaults to `python -m pytest -q`.
 
-## Tests
+## Testing
 
 ```sh
 make test
+python -m pytest -q
 ```
 
-## Tools and workflow
+Tests use mocked providers and do not make real model API calls.
 
-The agent starts with a simple inspect/implement/verify plan, sends bounded context to the selected model, validates each response as a JSON action, executes only allowlisted actions, records results, and verifies before reporting completion. OpenRouter uses its Chat Completions HTTP API; Groq uses its official Python SDK. Both require an explicitly configured model. `PRIMARY_PROVIDER` chooses the first attempt; `FALLBACK_PROVIDERS` sets ordered alternatives. Each provider is attempted at most once per generation call. Errors are sanitized.
+## Security
 
-File paths are resolved under the selected repository root. The terminal has a timeout and rejects common destructive commands. Git support is read-only; it never commits or pushes. Add a tool by implementing a narrow class under `tools/`, adding a named action dispatch in `src/agent.py`, and testing the behavior.
-
-## Security and limitations
-
-API credentials are passed only to provider SDKs and omitted from error output. Commands run with the current user's permissions, so the command blocklist is a guardrail rather than a complete sandbox. Run against repositories you trust. JSON actions are requested in the prompt and validated by the agent. Reviewers do not currently receive diffs because doing so transmits repository source to external services.
-
-## Evaluation workflow
-
-From a clean checkout, set provider credentials or evaluator `AI_API_KEY` and `AI_MODEL`, then run `make setup`, `make test`, and `make run TASK='...'`. `make clean` removes the virtual environment and generated Python/pytest caches.
+The harness never hard-codes provider credentials. Provider errors and Agent diagnostics redact known credentials. File operations stay inside the chosen repository. The terminal command guard is a safety measure, not a complete sandbox; only run the harness on repositories and tasks you trust. No automatic commit or push is performed.

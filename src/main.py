@@ -12,11 +12,16 @@ def main() -> int:
     parser.add_argument("--repo",default=".",help="Target repository (default: current directory)")
     parser.add_argument("--verify",default="python -m pytest -q",help="Verification command")
     parser.add_argument("--list-providers",action="store_true",help="List providers with configured API keys")
+    parser.add_argument("--tui",action="store_true",help="Launch the interactive terminal interface")
     args=parser.parse_args()
     if args.list_providers:
         print(", ".join(configured_providers()) or "No providers configured")
         return 0
-    task=args.task or input("Coding task: ").strip()
+    if args.tui or args.task is None:
+        from src.tui import run_tui
+        run_tui(args.repo,args.verify)
+        return 0
+    task=args.task.strip()
     if not task: parser.error("a task is required")
     try:
         model=TextModel()
