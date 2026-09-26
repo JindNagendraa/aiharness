@@ -48,6 +48,25 @@ def test_terminal_captures_output_and_blocks_dangerous(tmp_path):
     assert result.exit_code==0 and "42" in result.stdout
     assert terminal.run("rm -rf anything").exit_code==126
 
+def test_terminal_prefers_repository_virtualenv_path(tmp_path,monkeypatch):
+    import os
+    import sys
+    venv_bin=tmp_path/".venv"/"bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin/"python").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH","/usr/bin")
+    result=TerminalTool(tmp_path,timeout=2).run("python -c 'import sys; print(sys.executable)'")
+    assert result.exit_code==0
+    assert str(venv_bin) in result.stdout
+
+def test_terminal_uses_harness_interpreter_when_target_has_no_venv(tmp_path,monkeypatch):
+    import os
+    import sys
+    monkeypatch.setenv("PATH","/usr/bin")
+    result=TerminalTool(tmp_path,timeout=2).run("python -c 'import sys; print(sys.executable)'")
+    assert result.exit_code==0
+    assert sys.executable in result.stdout
+
 def test_context_bounded():
     ctx=RunContext("task",max_chars=100); ctx.add_file("a","x"*60); ctx.add_event("old"*20); ctx.add_event("new")
     assert ctx.size<=100 and "new" in ctx.prompt_view()
