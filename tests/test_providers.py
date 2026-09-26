@@ -59,17 +59,81 @@ def test_openrouter_success_parses_chat_completion(monkeypatch):
         def __enter__(self): return self
         def __exit__(self,*args): return None
         def read(self): return b'{"choices":[{"message":{"content":"{\\"action\\":\\"finish\\"}"}}]}'
-    def fake_urlopen(request,timeout):
-        calls.append((request,timeout))
+    def fake_urlopen(request,**kwargs):
+        calls.append((request,kwargs))
         return FakeResponse()
     monkeypatch.setattr("urllib.request.urlopen",fake_urlopen)
     config=ProviderConfig("openrouter","mock-key","vendor/model","https://openrouter.ai/api/v1")
     result=OpenRouterProvider(config).generate("prompt",[{"role":"user","content":"hi"}],json_mode=True)
     assert result=='{"action":"finish"}'
-    request,timeout=calls[0]
+    request,options=calls[0]
     assert request.full_url=="https://openrouter.ai/api/v1/chat/completions"
-    assert timeout==120
-    assert b'"response_format": {"type": "json_object"}' in request.data
+    assert options["timeout"]==120
+    import json
+    body=json.loads(request.data)
+    assert body["model"]=="vendor/model"
+    assert body["messages"]==[{"role":"user","content":"hi"}]
+    assert body["tool_choice"]=="auto"
+    assert body["parallel_tool_calls"] is False
+    assert "response_format" not in body
+    assert {tool["function"]["name"] for tool in body["tools"]}=={
+        "list_files","read_file","search_text","search_names","write_file","run_command","git_status","finish"
+    }
+
+def test_openrouter_native_tool_call_becomes_agent_action_json(monkeypatch):
+    calls=[]
+    arguments={"path":"calculator.py","content":"def add(a, b): return a + b"}
+    body={"model":"vendor/model","choices":[{"finish_reason":"tool_calls","message":{"content":None,"tool_calls":[{"type":"function","function":{"name":"write_file","arguments":__import__("json").dumps(arguments)}}]}}]}
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self,*args): return None
+        def read(self): return json.dumps(body).encode()
+    import json
+    monkeypatch.setattr("urllib.request.urlopen",lambda request,**kwargs:(calls.append(request),FakeResponse())[1])
+    config=ProviderConfig("openrouter","mock-key","vendor/model","https://openrouter.ai/api/v1")
+    result=OpenRouterProvider(config).generate("prompt",[],json_mode=True)
+    assert json.loads(result)=={"action":"write_file","arguments":{"path":"calculator.py","content":"def add(a, b): return a + b"}}
+
+def test_openrouter_empty_response_reports_safe_metadata(monkeypatch):
+    secret="router-secret-placeholder"
+    body={"model":"vendor/model","usage":{"prompt_tokens":10,"completion_tokens":0},"choices":[{"finish_reason":"length","message":{"content":None}}]}
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self,*args): return None
+        def read(self): return __import__("json").dumps(body).encode()
+    monkeypatch.setattr("urllib.request.urlopen",lambda *args,**kwargs:FakeResponse())
+    with pytest.raises(Exception) as caught:
+        OpenRouterProvider(ProviderConfig("openrouter",secret,"vendor/model","https://openrouter.ai/api/v1")).generate("",[],json_mode=True)
+    diagnostic=str(caught.value)
+    assert "no content or valid action" in diagnostic
+    assert "finish_reason=length" in diagnostic and "completion_tokens=0" in diagnostic
+    assert secret not in diagnostic
+
+def test_openrouter_uses_certifi_bundle_with_verification(monkeypatch):
+    from src.providers import openrouter_provider
+    import certifi
+    import ssl
+    calls={}
+    original_create_context=ssl.create_default_context
+    def fake_create_default_context(**kwargs):
+        calls["ssl_kwargs"]=kwargs
+        return original_create_context(**kwargs)
+    monkeypatch.setattr(openrouter_provider.ssl,"create_default_context",fake_create_default_context)
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self,*args): return None
+        def read(self): return b'{"choices":[{"message":{"content":"ok"}}]}'
+    def fake_urlopen(request,**kwargs):
+        calls["urlopen_kwargs"]=kwargs
+        return FakeResponse()
+    monkeypatch.setattr("urllib.request.urlopen",fake_urlopen)
+    provider=OpenRouterProvider(ProviderConfig("openrouter","mock-key","model","https://openrouter.ai/api/v1"))
+    assert provider.generate("",[])=="ok"
+    context=calls["urlopen_kwargs"]["context"]
+    assert calls["ssl_kwargs"]=={"cafile":certifi.where()}
+    assert context.verify_mode==ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    assert calls["urlopen_kwargs"]["timeout"]==120
 
 def test_openrouter_sanitizes_http_error(monkeypatch):
     secret="router-secret-placeholder"
@@ -95,6 +159,42 @@ def test_groq_success_and_json_mode(monkeypatch):
     assert result=='{"action":"finish"}'
     assert observed["client"]=={"api_key":"mock-key"}
     assert observed["model"]=="chosen-model"
+    assert "response_format" not in observed
+    assert observed["tool_choice"]=="auto"
+    assert observed["parallel_tool_calls"] is False
+    assert {tool["function"]["name"] for tool in observed["tools"]}=={
+        "list_files","read_file","search_text","search_names","write_file","run_command","git_status","finish"
+    }
+
+def test_groq_native_tool_call_becomes_agent_action_json(monkeypatch):
+    observed={}
+    tool_call=types.SimpleNamespace(function=types.SimpleNamespace(name="write_file",arguments='{"path":"calculator.py","content":"def add(a, b):\\n    return a + b\\n"}'))
+    class Response:
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=None,tool_calls=[tool_call]))]
+    class Completions:
+        def create(self,**kwargs): observed.update(kwargs); return Response()
+    class Client:
+        def __init__(self,**kwargs): self.chat=types.SimpleNamespace(completions=Completions())
+    monkeypatch.setitem(sys.modules,"groq",types.SimpleNamespace(Groq=Client))
+    result=GroqProvider(ProviderConfig("groq","mock-key","openai/gpt-oss-120b")).generate("prompt",[],json_mode=True)
+    import json
+    action=json.loads(result)
+    assert action=={"action":"write_file","arguments":{"path":"calculator.py","content":"def add(a, b):\n    return a + b\n"}}
+    assert observed["tool_choice"]=="auto"
+    assert "response_format" not in observed
+
+def test_groq_json_only_mode_without_tools(monkeypatch):
+    observed={}
+    class Response:
+        choices=[types.SimpleNamespace(message=types.SimpleNamespace(content='{"action":"finish","arguments":{}}',tool_calls=None))]
+    class Completions:
+        def create(self,**kwargs): observed.update(kwargs); return Response()
+    class Client:
+        def __init__(self,**kwargs): self.chat=types.SimpleNamespace(completions=Completions())
+    monkeypatch.setitem(sys.modules,"groq",types.SimpleNamespace(Groq=Client))
+    result=GroqProvider(ProviderConfig("groq","mock-key","model")).generate("",[],json_mode=True,use_tools=False)
+    assert result=='{"action":"finish","arguments":{}}'
+    assert "tools" not in observed and "tool_choice" not in observed
     assert observed["response_format"]=={"type":"json_object"}
 
 def test_groq_malformed_response_is_reported(monkeypatch):
