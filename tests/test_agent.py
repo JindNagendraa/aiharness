@@ -107,6 +107,25 @@ def test_agent_state_transitions_and_verifies(tmp_path):
     result=Agent(tmp_path,model,verify_command="python -c 'print(\"verified\")'").run("inspect project")
     assert result["state"]=="complete" and result["verification"]["passed"]
 
+
+
+def test_agent_rejects_missing_required_action_argument(tmp_path):
+    model = FakeModel([])
+    agent = Agent(
+        tmp_path,
+        model,
+        verify_command="python -c 'print(1)'",
+    )
+
+    import pytest
+
+    with pytest.raises(
+        ValueError,
+        match="missing required argument.*query",
+    ):
+        agent._action("search_names", {})
+
+
 def test_agent_fails_when_verification_fails(tmp_path):
     model=FakeModel([{"action":"finish","arguments":{}}])
     result=Agent(tmp_path,model,verify_command="python -c 'raise SystemExit(3)'").run("task")

@@ -123,6 +123,20 @@ class Agent:
         return result
 
     def _action(self, action: str, args: dict) -> str:
+        required = {
+            "read_file": ["path"],
+            "search_text": ["query"],
+            "search_names": ["query"],
+            "write_file": ["path", "content"],
+            "run_command": ["command"],
+        }
+
+        missing = [key for key in required.get(action, []) if key not in args]
+        if missing:
+            raise ValueError(
+                f"Invalid action '{action}': missing required argument(s): {', '.join(missing)}"
+            )
+
         if action=="list_files": return json.dumps(self.files.list_files())
         if action=="read_file":
             content=self.files.read_file(str(args["path"])); self.context.add_file(str(args["path"]),content); return content[:5000]
